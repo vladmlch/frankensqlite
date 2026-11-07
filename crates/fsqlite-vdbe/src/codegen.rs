@@ -3163,7 +3163,8 @@ pub fn codegen_select(
     // (rowid order = full-scan order) and re-apply the whole WHERE per row, instead of full-scanning. The
     // bare range (no residual) is owned by `rowid_range` above; this handles ONLY the conjunction case
     // (`has_residual`). Gated to no-LIMIT so nothing before the residual filter emits a placeholder (the
-    // detector already requires integer-literal bounds), keeping the residual `?` numbering trivial.
+    // detector requires integer-literal or numbered-placeholder bounds and, when a bound is numbered,
+    // rejects any anonymous/named placeholder in the WHERE), keeping the residual `?` numbering exact.
     let rowid_range_residual =
         if rowid_range_allowed && rowid_range.is_none() && stmt.limit.is_none() {
             extract_rowid_range_residual_target(where_clause.as_deref(), table, table_alias)
@@ -6929,8 +6930,8 @@ fn codegen_select_rowid_range_scan(
     // `rowid <range> AND <residual>`. The walk visits the `[lower, upper]` slice (a superset of the
     // matches) in rowid order; the residual narrows it. Byte-identical to the full scan (same rows, same
     // order, fewer visited). `false` for the plain-range callers → byte-identical. The residual hoist
-    // requires integer-literal bounds and no LIMIT, so nothing before the filter emits a placeholder.
-    // bd-nonagg-rowid-range-residual.
+    // requires integer-literal or numbered-placeholder bounds and no LIMIT, so nothing before the filter
+    // emits an anonymous placeholder. bd-nonagg-rowid-range-residual.
     residual_filter: bool,
 ) -> Result<(), CodegenError> {
     // Captured before any placeholder-emitting op so the re-applied WHERE re-numbers a residual `?` from
@@ -34948,14 +34949,38 @@ fn extract_rowid_range_residual_target<'a>(
     if target.lower.is_none() && target.upper.is_none() {
         return None;
     }
-    // The seek probe emits the bound values, so require integer-LITERAL bounds: then it emits no
-    // anonymous placeholders and a `?` can appear only in the residual, where the filter numbers it
-    // identically to the scan path (bd-agg-param-residual). A placeholder bound (`id > ?`) declines.
-    let literal_bound = |b: &Option<RowidRangeBound<'a>>| {
-        b.as_ref()
-            .is_none_or(|bound| matches!(bound.expr, Expr::Literal(Literal::Integer(_), _)))
+    // The seek probe emits the bound values, so bounds must be integer LITERALS or NUMBERED
+    // placeholders. A literal emits no placeholder at all, so a `?` can appear only in the
+    // residual, where the filter numbers it identically to the scan path (bd-agg-param-residual).
+    // A NUMBERED bound emits a position-independent `Variable n` (numbered placeholders never
+    // consume the anonymous counter), so the probe emission cannot shift the residual's numbering
+    // either — but then the WHERE must contain NO anonymous/named placeholder at all: the filter
+    // re-applies the whole WHERE, and re-numbering an anonymous/named slot from the captured base
+    // could collide with the probe's slots (`id > ?1 AND v = ?` would re-emit the residual `?` as
+    // slot 1). The connection canonicalizes every bind to `?NNN`, so plain `?` users reach the
+    // numbered form; other raw shapes keep the correct (just slower) full scan.
+    let seek_safe_bound = |b: &Option<RowidRangeBound<'a>>| {
+        b.as_ref().is_none_or(|bound| {
+            matches!(
+                bound.expr,
+                Expr::Literal(Literal::Integer(_), _)
+                    | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
+            )
+        })
     };
-    if !literal_bound(&target.lower) || !literal_bound(&target.upper) {
+    if !seek_safe_bound(&target.lower) || !seek_safe_bound(&target.upper) {
+        return None;
+    }
+    let has_numbered_placeholder_bound = [target.lower.as_ref(), target.upper.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|bound| {
+            matches!(
+                bound.expr,
+                Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
+            )
+        });
+    if has_numbered_placeholder_bound && expr_contains_non_numbered_placeholder(expr) {
         return None;
     }
     rowid_range_fast_path_is_safe(target).then_some((target, true))
@@ -45043,6 +45068,96 @@ mod tests {
         assert!(
             ops.iter().any(|op| op.opcode == Opcode::SeekGT),
             "the rowid range residual seeks the table b-tree"
+        );
+    }
+
+    /// `WHERE <rowid> <placeholder range> AND <residual>` walks only the [lower, upper] rowid
+    /// slice and re-applies the whole WHERE per row. Numbered bounds keep their textual slots in
+    /// the seek probes regardless of the conjuncts' text order — the filter re-emission
+    /// re-derives the text order independently.
+    #[test]
+    fn nonaggregate_rowid_range_residual_placeholder_bounds_seek() {
+        // Numbered lower bound + numbered residual: probes then filter.
+        let ops = bd_2dgf5_program("SELECT id, v FROM t WHERE id > ?1 AND v = ?2");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGT),
+            "a placeholder rowid range + residual must SeekGT"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "a placeholder rowid range + residual must not full-scan"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1, 1, 2],
+            "the lower probe emits slot 1; the filter re-applies the whole WHERE (slots 1, 2)"
+        );
+
+        // Reversed text order (`id < ?2` written first): the probes still bind each bound to
+        // ITS OWN textual slot (lower=?1, upper=?2), and the filter re-applies in text order.
+        let ops = bd_2dgf5_program("SELECT id, v FROM t WHERE id < ?2 AND id >= ?1 AND v = ?3");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "the inclusive placeholder lower bound must SeekGE"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1, 2, 2, 1, 3],
+            "probes emit by slot (lower=?1, upper=?2); the filter re-applies text order (?2, ?1, ?3)"
+        );
+
+        // BETWEEN form with placeholder bounds + residual.
+        let ops = bd_2dgf5_program("SELECT id, v FROM t WHERE id BETWEEN ?1 AND ?2 AND v = ?3");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "a placeholder BETWEEN + residual must SeekGE the lower bound"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1, 2, 1, 2, 3],
+            "BETWEEN probes emit slots 1, 2; the filter re-applies the whole WHERE"
+        );
+
+        // The residual may itself carry the only placeholders (literal bounds unchanged).
+        let ops = bd_2dgf5_program("SELECT id, v FROM t WHERE id > 5 AND v = ?");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGT),
+            "literal bounds with an anonymous residual `?` keep the existing seek"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1],
+            "the anonymous residual `?` numbers from the WHERE's textual base"
+        );
+    }
+
+    /// Declines for the placeholder-bounded rowid range residual: raw anonymous/named bound
+    /// placeholders (no canonicalization) keep the full scan, and the bare placeholder range
+    /// (no residual) keeps its existing seek.
+    #[test]
+    fn nonaggregate_rowid_range_residual_placeholder_declines() {
+        for sql in [
+            "SELECT id, v FROM t WHERE id > ? AND v = ?2",
+            "SELECT id, v FROM t WHERE id > :lo AND v = ?1",
+            "SELECT id, v FROM t WHERE id > ?1 AND v = ?",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            assert!(
+                !ops.iter().any(|op| matches!(op.opcode, Opcode::SeekGT | Opcode::SeekGE)),
+                "raw non-numbered slots must decline the placeholder rowid range residual: `{sql}`"
+            );
+        }
+
+        // Bare placeholder range without a residual: unchanged, still seeks (slots emit once).
+        let ops = bd_2dgf5_program("SELECT id FROM t WHERE id > ?1");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGT),
+            "the bare placeholder rowid range keeps its seek"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1],
+            "the bare range emits its bound exactly once"
         );
     }
 
