@@ -27568,15 +27568,25 @@ fn index_eq_residual_seek_target<'a, 't>(
 type IndexEqSeekTarget<'a, 't> = (&'t IndexSchema, Vec<(&'a Expr, char)>, bool);
 
 /// [`index_eq_residual_seek_target`], extended (GH#434) to an index whose
-/// every key column is pinned by an equality with a literal, a numbered or
-/// named parameter, or a constant expression over those (bd-aavtp), such as
-/// the autoindex of a composite PRIMARY KEY.
+/// key columns are pinned by an equality with a literal, a numbered or named
+/// parameter, or a constant expression over those (bd-aavtp), such as the
+/// autoindex of a composite PRIMARY KEY — and (bd-j9gub) to a PREFIX of
+/// those columns: `WHERE a = 3` on `(a, b)` seeks the pinned `a = 3` block
+/// instead of full-scanning.
 ///
-/// Only the full key qualifies: the probe `(v1, ..., vn, i64::MIN)` then
-/// compares its trailing field with the rowid. After a partial prefix it
-/// would compare with the next key column, where NULLs sort first. TEXT key
-/// columns must compare BINARY in both the index and the column, as for
-/// the single-column seek.
+/// The longest pinned prefix across the table's indexes wins (narrowest
+/// block); ties keep schema order. A pinned term must be ASC (the collect
+/// walks ascending) and carry an admitted affinity — INTEGER/NUMERIC/REAL
+/// or BINARY-collated TEXT on both the index term and the column — so the
+/// first DESC, NOCASE-text or untyped term ends the prefix there. Terms
+/// after the prefix never constrain the probe: the record comparator sorts
+/// a k-field probe before every entry that extends it, so `SeekGE` lands on
+/// the block start and the per-column equality walk ends the block — a
+/// trailing NULL-able or DESC term cannot displace the probe.
+///
+/// The full-key probe `(v1, ..., vn, i64::MIN)` keeps comparing its trailing
+/// field with the rowid, byte-identical to GH#434; a partial prefix uses
+/// the bare `(v1, ..., vk)` record (see [`emit_index_eq_rowset_collect`]).
 fn index_key_eq_residual_seek_target<'a, 't>(
     where_clause: Option<&'a Expr>,
     table: &'t TableSchema,
@@ -27601,51 +27611,80 @@ fn index_key_eq_residual_seek_target<'a, 't>(
         })
         .filter(|(_, target, _)| is_rowid_range_constant(target))
         .collect();
-    table
+    let mut best: Option<IndexEqSeekTarget<'a, 't>> = None;
+    for idx in table
         .indexes
         .iter()
         .filter(|idx| idx.supports_direct_column_lookup() && idx.key_term_count() >= 2)
-        .find_map(|idx| {
-            let mut targets = Vec::with_capacity(idx.key_term_count());
-            let mut consumed = Vec::with_capacity(idx.key_term_count());
-            for (term, column_name) in idx.columns.iter().enumerate() {
-                if idx.key_term_descending(term) {
-                    return None;
-                }
-                let (_, target, conjunct) = equalities
-                    .iter()
-                    .find(|(name, _, _)| name.eq_ignore_ascii_case(column_name))?;
-                if !consumed.contains(conjunct) {
-                    consumed.push(*conjunct);
-                }
-                let column = table.columns.get(table.column_index(column_name)?)?;
-                let affinity = column.affinity;
-                if !matches!(affinity, 'D' | 'C' | 'E' | 'B') {
-                    return None;
-                }
-                let binary = |collation: Option<&str>| {
-                    collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
-                };
-                if affinity == 'B'
-                    && !(binary(idx.key_term_collation(term)) && binary(column.collation.as_deref()))
-                {
-                    return None;
-                }
-                targets.push((*target, affinity));
+    {
+        let mut targets = Vec::with_capacity(idx.key_term_count());
+        let mut consumed = Vec::with_capacity(idx.key_term_count());
+        for (term, column_name) in idx.columns.iter().enumerate() {
+            // A term that cannot join the probe (DESC, unpinned, wrong
+            // affinity, non-BINARY text) ends the prefix here; the terms
+            // pinned so far still form a seekable block.
+            if idx.key_term_descending(term) {
+                break;
             }
-            // An index can repeat a column (`(a, a)`), so one conjunct may
-            // feed several key terms. The WHERE is fully enforced by the seek
-            // only when every conjunct fed a key term; otherwise the leftover
-            // terms (a gate, a contradictory `a = 2`) run as a residual.
-            Some((idx, targets, consumed.len() < conjuncts.len()))
-        })
+            let Some((_, target, conjunct)) = equalities
+                .iter()
+                .find(|(name, _, _)| name.eq_ignore_ascii_case(column_name))
+            else {
+                break;
+            };
+            let Some(column) = table
+                .column_index(column_name)
+                .and_then(|column| table.columns.get(column))
+            else {
+                // A key column absent from the table is schema corruption,
+                // not a prefix boundary: decline this index whole.
+                targets.clear();
+                break;
+            };
+            let affinity = column.affinity;
+            if !matches!(affinity, 'D' | 'C' | 'E' | 'B') {
+                break;
+            }
+            let binary = |collation: Option<&str>| {
+                collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+            };
+            if affinity == 'B'
+                && !(binary(idx.key_term_collation(term)) && binary(column.collation.as_deref()))
+            {
+                break;
+            }
+            if !consumed.contains(conjunct) {
+                consumed.push(*conjunct);
+            }
+            targets.push((*target, affinity));
+        }
+        if targets.is_empty() {
+            continue;
+        }
+        // An index can repeat a column (`(a, a)`), so one conjunct may
+        // feed several key terms. The WHERE is fully enforced by the seek
+        // only when every conjunct fed a key term; otherwise the leftover
+        // terms (a gate, a range, a contradictory `a = 2`) run as a residual.
+        let candidate = (idx, targets, consumed.len() < conjuncts.len());
+        let narrows = best
+            .as_ref()
+            .is_none_or(|(_, best_targets, _)| candidate.1.len() > best_targets.len());
+        if narrows {
+            best = Some(candidate);
+        }
+    }
+    best
 }
 
-/// DELETE/UPDATE Pass-1 collection for `WHERE <single-col-ASC-integer-indexed> = <value> [AND
-/// <residual>]`: open a FRESH read cursor on the index (distinct from the table cursor and the registered
-/// index-maintenance cursors, so Pass 2 is unaffected), seek `(val, i64::MIN)`, walk the equal-value run
-/// adding each rowid to the RowSet, then close the cursor. The probe is coerced to the column's 'D'
-/// affinity (`Opcode::Affinity`) when it is not already a numeric literal — so a runtime-typed placeholder
+/// DELETE/UPDATE Pass-1 collection for `WHERE <indexed cols> = <values> [AND <residual>]`: open a
+/// FRESH read cursor on the index (distinct from the table cursor and the registered
+/// index-maintenance cursors, so Pass 2 is unaffected), seek, walk the equal-value run
+/// adding each rowid to the RowSet, then close the cursor. A full-key probe seeks
+/// `(v1, ..., vn, i64::MIN)` (GH#434); a PREFIX probe (bd-j9gub) seeks the bare
+/// `(v1, ..., vk)` record — the record comparator sorts a shorter record before every
+/// entry that extends it, so `SeekGE` lands on the block start without padding the
+/// unconstrained trailing terms. The probe is coerced to the column's affinity
+/// (`Opcode::Affinity`) when it is not already a matching literal — so a runtime-typed placeholder
 /// bound seeks identically to the full-scan filter and the seek is authoritative (no affinity fallback).
 /// When `residual_filter` is true, each candidate is positioned on the table cursor and the full WHERE is
 /// applied before `RowSetAdd` (no covering decision in a DML collect — the row is always read). Control
@@ -27656,9 +27695,10 @@ fn emit_index_eq_rowset_collect(
     b: &mut ProgramBuilder,
     idx_read_cursor: i32,
     idx_schema: &IndexSchema,
-    // One probe value per leading key column, with that column's affinity ('D' integer / 'C' numeric /
-    // 'E' real / 'B' binary-text) — coerced onto a runtime-typed probe so it seeks like the
-    // affinity-applying comparison would. More than one entry covers the index's full key (GH#434).
+    // One probe value per pinned leading key column, with that column's affinity ('D' integer / 'C'
+    // numeric / 'E' real / 'B' binary-text) — coerced onto a runtime-typed probe so it seeks like the
+    // affinity-applying comparison would. Pinning every key column is the GH#434 full-key seek;
+    // pinning a leading subset (bd-j9gub) is a prefix seek with no i64::MIN rowid floor.
     targets: &[(&Expr, char)],
     rowset_reg: i32,
     rowid_reg: i32,
@@ -27675,7 +27715,15 @@ fn emit_index_eq_rowset_collect(
 ) {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let key_count = targets.len() as i32;
-    let probe_key_regs = b.alloc_regs(key_count + 1);
+    // bd-j9gub: a probe covering fewer columns than the index key is a true k-field
+    // prefix record — no i64::MIN pad. Padding the unconstrained trailing terms is not
+    // a block floor when such a term can hold NULL (NULL sorts before every integer,
+    // so the pad would position past real block entries), while the record comparator
+    // already sorts a k-field probe before every entry that extends it. The full-key
+    // probe keeps its `(v1, ..., vn, i64::MIN)` rowid floor, byte-identical to GH#434.
+    let prefix_probe = targets.len() < idx_schema.key_term_count();
+    let probe_field_count = key_count + i32::from(!prefix_probe);
+    let probe_key_regs = b.alloc_regs(probe_field_count);
     let min_rowid_reg = probe_key_regs + key_count;
     // Emit the probe values, numbering an anon placeholder from the base, and coerce a runtime-typed bound
     // to the column's affinity so the seek positions like the affinity-applying comparison would.
@@ -27693,12 +27741,14 @@ fn emit_index_eq_rowset_collect(
             );
         }
     }
-    b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+    if !prefix_probe {
+        b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+    }
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
         probe_key_regs,
-        key_count + 1,
+        probe_field_count,
         probe_record_reg,
         P4::None,
         0,
@@ -27775,8 +27825,9 @@ fn emit_index_eq_rowset_collect(
 /// Generate VDBE bytecode for a DELETE statement.
 ///
 /// Uses a two-pass plan: collect exact matching rowids without mutating the table, then revisit those
-/// rowids to maintain indexes, emit `RETURNING`, and delete. Equality, literal-IN, and lower-bounded
-/// literal-range predicates use direct seeks; all other predicates use the general filtered table scan.
+/// rowids to maintain indexes, emit `RETURNING`, and delete. Equality (over a rowid, a full index key,
+/// or a PREFIX of an index's key columns — bd-j9gub), literal-IN, and lower-bounded literal-range
+/// predicates use direct seeks; all other predicates use the general filtered table scan.
 pub fn codegen_delete(
     b: &mut ProgramBuilder,
     stmt: &DeleteStatement,
@@ -46748,6 +46799,190 @@ mod tests {
                 !ops.iter().any(|op| op.opcode == Opcode::OpenAutoindex
                     && ops.iter().any(|o| o.opcode == Opcode::SeekRowid && o.p1 == 0)),
                 "`{sql}` must not build a rowid probe set"
+            );
+        }
+    }
+
+    /// bd-j9gub table: `t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, n INTEGER)` with two
+    /// composite indexes, `t_ab(a, b)` then `t_an(a, n)` — no single-column index, so a
+    /// leading-column equality pins only a PREFIX and the pre-fix code declined it.
+    fn bd_j9gub_table() -> TableSchema {
+        let typed = |name: &str, affinity: char, is_ipk: bool| {
+            ColumnInfo::basic(name, affinity, is_ipk)
+        };
+        let index = |name: &str, root: i32, columns: &[&str]| IndexSchema {
+            name: name.to_owned(),
+            root_page: root,
+            columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            key_expressions: columns.iter().map(|c| (*c).to_owned()).collect(),
+            key_sort_directions: Vec::new(),
+            where_clause: None,
+            is_unique: false,
+            key_collations: Vec::new(),
+            conflict_action: None,
+        };
+        TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                typed("id", 'D', true),
+                typed("a", 'D', false),
+                typed("b", 'D', false),
+                typed("n", 'D', false),
+            ],
+            indexes: vec![index("t_ab", 3, &["a", "b"]), index("t_an", 4, &["a", "n"])],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
+    }
+
+    /// bd-j9gub: DELETE/UPDATE whose equality conjuncts pin a PREFIX of a composite index's
+    /// key columns (leading column only, or the first two against a longer key elsewhere;
+    /// literal or numbered parameter; with or without residual conjuncts) must seek the
+    /// index instead of full-scanning the table, and the longest pinned prefix must win
+    /// the index choice. A WHERE that pins no leading column of any index must keep
+    /// scanning. Results/semantics are covered by `bd_j9gub_dml_prefix_seek_oracle`.
+    #[test]
+    fn bd_j9gub_dml_seeks_composite_index_prefix() {
+        let program = |sql: &str| -> Vec<VdbeOp> {
+            let Some((statement, tail)) =
+                parse_first_statement_with_tail(sql).expect("test SQL should parse")
+            else {
+                unreachable!("expected parsed statement");
+            };
+            assert_eq!(tail, sql.len(), "parser left trailing SQL: {sql}");
+            let schema = vec![bd_j9gub_table()];
+            let mut b = ProgramBuilder::new();
+            let ctx = CodegenContext::default();
+            match statement {
+                Statement::Update(stmt) => codegen_update(&mut b, &stmt, &schema, &ctx),
+                Statement::Delete(stmt) => codegen_delete(&mut b, &stmt, &schema, &ctx),
+                other => panic!("unexpected statement {other:?}"),
+            }
+            .unwrap_or_else(|e| panic!("`{sql}` should compile: {e}"));
+            b.finish().expect("program should finish").ops().to_vec()
+        };
+        // The one fresh index-read cursor a seek program opens, or None when the
+        // program opens no index for reading (a scan).
+        let index_read_cursor = |ops: &[VdbeOp]| -> Option<(i32, String)> {
+            ops.iter().find_map(|op| {
+                if op.opcode == Opcode::OpenRead
+                    && let P4::Index(name) = &op.p4
+                {
+                    Some((op.p1, name.clone()))
+                } else {
+                    None
+                }
+            })
+        };
+        let table_walks = |ops: &[VdbeOp]| {
+            ops.iter()
+                .filter(|op| {
+                    op.p1 == 0
+                        && matches!(
+                            op.opcode,
+                            Opcode::Rewind | Opcode::Next | Opcode::Last | Opcode::Prev
+                        )
+                })
+                .count()
+        };
+        // The field count of the MakeRecord feeding the first SeekGE on the index
+        // read cursor: the pinned prefix width (a true prefix record), or one more
+        // when the probe carries the full key plus its rowid floor.
+        let probe_record_width = |ops: &[VdbeOp], cursor: i32| -> Option<i32> {
+            let seek = ops.iter().find(|op| {
+                matches!(op.opcode, Opcode::SeekGE | Opcode::SeekLE) && op.p1 == cursor
+            })?;
+            ops.iter()
+                .find(|op| op.opcode == Opcode::MakeRecord && op.p3 == seek.p3)
+                .map(|op| op.p2)
+        };
+        let table_seeks = |ops: &[VdbeOp]| {
+            ops.iter()
+                .filter(|op| op.opcode == Opcode::SeekRowid && op.p1 == 0)
+                .count()
+        };
+
+        // (sql, seeked index, probe width, expected SeekRowid count on the table cursor)
+        // Probe width 1 = a true one-field prefix record (no padded rowid floor);
+        // width 3 = full key (a, b) + i64::MIN floor, byte-identical to GH#434.
+        // Bare shapes re-seek the table once (Pass 2); residual shapes twice (the
+        // collect positions each candidate to re-apply the full WHERE, then Pass 2).
+        let seek_shapes: &[(&str, &str, i32, usize)] = &[
+            ("DELETE FROM t WHERE a = 3", "t_ab", 1, 1),
+            ("DELETE FROM t WHERE a = ?1", "t_ab", 1, 1),
+            ("DELETE FROM t WHERE a = 3 AND n > 5", "t_ab", 1, 2),
+            ("DELETE FROM t WHERE a = ?1 AND b > ?2", "t_ab", 1, 2),
+            ("UPDATE t SET n = n + 1 WHERE a = 3", "t_ab", 1, 1),
+            ("UPDATE t SET n = n + 1 WHERE a = ?1", "t_ab", 1, 1),
+            ("UPDATE t SET n = ?2 WHERE a = ?1 AND n > 0", "t_ab", 1, 2),
+            // Longest pinned prefix wins: (a, b) and (a, n) both start with a, so
+            // pinning the second column selects the index it completes.
+            ("DELETE FROM t WHERE a = 3 AND b = 4", "t_ab", 3, 1),
+            ("DELETE FROM t WHERE a = ?1 AND b = ?2", "t_ab", 3, 1),
+            ("DELETE FROM t WHERE a = 3 AND n = 7", "t_an", 3, 1),
+            ("UPDATE t SET n = n + 1 WHERE a = 3 AND b = 4", "t_ab", 3, 1),
+            // The pinned prefix is narrowed but the trailing key column stays
+            // unconstrained: a two-field prefix of t_ab's (a, b) key.
+            ("DELETE FROM t WHERE a = 3 AND b = 4 AND n > 1", "t_ab", 3, 2),
+            ("UPDATE t SET n = n + 1 WHERE a = 3 AND n = 7", "t_an", 3, 1),
+        ];
+        for &(sql, expected_index, expected_width, expected_seeks) in seek_shapes {
+            let ops = program(sql);
+            let Some((cursor, index)) = index_read_cursor(&ops) else {
+                panic!("`{sql}` must open a fresh index read cursor and seek it");
+            };
+            assert_eq!(
+                index, expected_index,
+                "`{sql}` must pick the longest pinned prefix index"
+            );
+            assert_eq!(
+                table_walks(&ops),
+                0,
+                "`{sql}` must not walk the table cursor"
+            );
+            assert!(
+                ops.iter()
+                    .any(|op| matches!(op.opcode, Opcode::SeekGE) && op.p1 == cursor),
+                "`{sql}` must SeekGE the index read cursor"
+            );
+            assert_eq!(
+                probe_record_width(&ops, cursor),
+                Some(expected_width),
+                "`{sql}` probe record width"
+            );
+            assert_eq!(
+                table_seeks(&ops),
+                expected_seeks,
+                "`{sql}` table SeekRowid count (collect residual + Pass 2)"
+            );
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::Close && op.p1 == cursor),
+                "`{sql}` must close the index read cursor before Pass 2"
+            );
+        }
+
+        // No index has these columns first (or at all): the collect must keep the
+        // full-scan RowSet plan.
+        for sql in [
+            "DELETE FROM t WHERE b = 3",
+            "DELETE FROM t WHERE n = 5",
+            "DELETE FROM t WHERE b = 3 AND n = 5",
+            "UPDATE t SET n = n + 1 WHERE b = 3",
+            "UPDATE t SET n = n + 1 WHERE n = 5",
+            "UPDATE t SET b = ?1 WHERE n > ?2",
+        ] {
+            let ops = program(sql);
+            assert!(
+                table_walks(&ops) > 0,
+                "`{sql}` pins no index prefix and must scan the table"
+            );
+            assert!(
+                index_read_cursor(&ops).is_none(),
+                "`{sql}` must not open an index read cursor"
             );
         }
     }
