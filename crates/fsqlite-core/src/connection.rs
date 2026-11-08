@@ -100368,6 +100368,22 @@ impl Connection {
                 )]
             }
             Statement::Update(update) => {
+                // bd-j9gub: render the access path the emitted program
+                // performs, with the SELECT arm's doctrine — a seek claim is
+                // an opcode fact, not codegen intent. A prefix-pinned UPDATE
+                // now compiles to an index seek, and stock SQLite reports
+                // `SEARCH t USING INDEX i (a=?)` for that plan, with no
+                // `(UPDATE)` suffix.
+                if let Ok(program) = self.compile_table_update(update)
+                    && let Some(detail) = self.dml_index_seek_eqp_detail(
+                        &program,
+                        &update.table.name.name,
+                        update.table.alias.as_deref(),
+                        update.where_clause.as_ref(),
+                    )
+                {
+                    return vec![to_row(2, 0, 0, detail)];
+                }
                 vec![to_row(
                     2,
                     0,
@@ -100376,6 +100392,17 @@ impl Connection {
                 )]
             }
             Statement::Delete(delete) => {
+                // bd-j9gub: see the Update arm.
+                if let Ok(program) = self.compile_table_delete(delete)
+                    && let Some(detail) = self.dml_index_seek_eqp_detail(
+                        &program,
+                        &delete.table.name.name,
+                        delete.table.alias.as_deref(),
+                        delete.where_clause.as_ref(),
+                    )
+                {
+                    return vec![to_row(2, 0, 0, detail)];
+                }
                 vec![to_row(
                     2,
                     0,
@@ -100385,6 +100412,56 @@ impl Connection {
             }
             _ => vec![to_row(2, 0, 0, "SCAN".to_owned())],
         }
+    }
+
+    /// `EXPLAIN QUERY PLAN` detail for an UPDATE/DELETE whose emitted program
+    /// seeks an index (bd-j9gub).
+    ///
+    /// The SEARCH-vs-SCAN decision is read off the opcodes the program will
+    /// actually run (`program_index_seek_facts` / `program_index_seek_key_width`),
+    /// exactly like the SELECT arm — no second copy of codegen's gates to
+    /// drift. Only the names are resolved here, from the schema. Stock SQLite
+    /// reports this plan with no `(UPDATE)`/`(DELETE)` suffix, so neither do
+    /// we; anything the opcodes cannot vouch for keeps the static SCAN row.
+    fn dml_index_seek_eqp_detail(
+        &self,
+        program: &VdbeProgram,
+        table_name: &str,
+        table_alias: Option<&str>,
+        where_clause: Option<&Expr>,
+    ) -> Option<String> {
+        let seek = crate::explain::program_index_seek_facts(program)?;
+        let seek_key_columns =
+            crate::explain::program_index_seek_key_width(program, &seek.index_name)?;
+        let schema = self.schema.borrow();
+        let table = schema
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(table_name))?;
+        // WITHOUT ROWID DML has no index-seek collect today; stay defensive
+        // so a future seek there reports nothing rather than a wrong name.
+        if table.without_rowid {
+            return None;
+        }
+        let index = table
+            .indexes
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(&seek.index_name))?;
+        let Some(leading) = index.columns.first() else {
+            return None;
+        };
+        let key_terms = index_seek_eqp_equality_key_terms(
+            where_clause,
+            table_name,
+            table_alias,
+            index,
+            Some(seek_key_columns),
+        )
+        .unwrap_or_else(|| format!("{leading}=?"));
+        let displayed = table_alias.unwrap_or(table_name);
+        Some(format!(
+            "SEARCH {displayed} USING INDEX {} ({key_terms})",
+            index.name
+        ))
     }
 
     /// Execute a VDBE program with the in-memory database attached.
