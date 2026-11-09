@@ -1799,6 +1799,9 @@ enum WorkerOpenRequest {
     SchemaOnlyWithWalIndexRecovery {
         path: String,
     },
+    StrictReadOnly {
+        path: String,
+    },
     SchemaOnlyWithEnv {
         path: String,
         env: ConnectionEnv,
@@ -1887,6 +1890,13 @@ impl WorkerOpenRequest {
             }
             Self::SchemaOnlyWithWalIndexRecovery { path } => {
                 Connection::open_schema_only_with_wal_index_recovery_and_env(
+                    path,
+                    dedicated_worker_env(ConnectionEnv::default()),
+                )
+                .await
+            }
+            Self::StrictReadOnly { path } => {
+                Connection::open_strict_read_only_with_env(
                     path,
                     dedicated_worker_env(ConnectionEnv::default()),
                 )
@@ -2263,6 +2273,21 @@ impl AsyncConnection {
         Self::open_sync_with_request(WorkerOpenRequest::SchemaOnlyWithWalIndexRecovery {
             path: path.into(),
         })
+    }
+
+    /// Open a database strictly read-only on the dedicated worker thread.
+    ///
+    /// Routes to [`Connection::open_strict_read_only`] (see its documentation
+    /// for the full contract). The open and every operation on the connection
+    /// leave the database, `-wal`, `-shm`, and every other sidecar byte- and
+    /// mtime-identical, creating no new file; a WAL index that needs recovery
+    /// to be read is refused with the typed [`FrankenError::BusyRecovery`]
+    /// instead of being rebuilt onto the `-shm`. Equivalent to
+    /// [`Self::open_with_flags_sync`] with
+    /// `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_STRICT_READ_ONLY` and to
+    /// [`crate::compat::open_strict_read_only`].
+    pub fn open_strict_read_only_sync(path: impl Into<String>) -> Result<Self, FrankenError> {
+        Self::open_sync_with_request(WorkerOpenRequest::StrictReadOnly { path: path.into() })
     }
 
     /// Open an existing database in read-only schema-only mode with a custom
@@ -7484,6 +7509,110 @@ c.close()
         conn.execute_sync("INSERT INTO t VALUES (2, 'refused')")
             .expect_err("read-only schema-only mode must refuse writes");
         conn.close_sync().expect("close should succeed");
+    }
+
+    #[cfg(all(feature = "native", unix))]
+    #[test]
+    fn open_strict_read_only_sync_never_touches_a_damaged_wal_index() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("strict-readonly-sync.db");
+        let mut writer =
+            AsyncConnection::open_sync(path.to_str().unwrap()).expect("open the fixture writer");
+        for sql in [
+            "PRAGMA journal_mode=WAL",
+            "PRAGMA wal_autocheckpoint=0",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL)",
+        ] {
+            writer
+                .execute_sync(sql)
+                .unwrap_or_else(|error| panic!("fixture: {sql}: {error}"));
+        }
+        for id in 1..=12i64 {
+            writer
+                .execute_sync(&format!("INSERT INTO t VALUES ({id}, 'issue-{id}')"))
+                .expect("fixture insert");
+        }
+        writer
+            .close_without_checkpoint_sync()
+            .expect("close the fixture writer without checkpointing");
+        let sidecar = |suffix: &str| {
+            let mut name = path.as_os_str().to_owned();
+            name.push(suffix);
+            std::path::PathBuf::from(name)
+        };
+        let fingerprint = |file: &std::path::Path| {
+            (
+                std::fs::read(file).unwrap(),
+                std::fs::metadata(file).unwrap().modified().unwrap(),
+            )
+        };
+        let shm = sidecar("-shm");
+        assert!(shm.exists(), "the fixture leaves a -shm");
+
+        // A valid index: the strict constructor reads it without touching it.
+        let before = fingerprint(&shm);
+        let mut connection = AsyncConnection::open_strict_read_only_sync(path.to_str().unwrap())
+            .expect("strict read-only open of a valid store");
+        let rows = connection
+            .query_sync("SELECT id FROM t ORDER BY id")
+            .unwrap();
+        let ids: Vec<i64> = rows
+            .iter()
+            .map(|row| match row.get(0) {
+                Some(SqliteValue::Integer(id)) => *id,
+                other => panic!("unexpected id {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, (1..=12).collect::<Vec<_>>());
+        assert!(matches!(
+            connection.execute_sync("INSERT INTO t VALUES (99, 'forbidden')"),
+            Err(FrankenError::ReadOnly)
+        ));
+        connection.close_sync().expect("close the strict reader");
+        assert_eq!(
+            fingerprint(&shm),
+            before,
+            "a valid -shm stays byte- and mtime-identical"
+        );
+
+        // A zeroed index: the strict constructor refuses it without rewriting
+        // the file, where plain 0.4.13 rebuilds it in place (GH#528).
+        std::fs::write(&shm, vec![0u8; 32 * 1024]).unwrap();
+        let main_before = fingerprint(&path);
+        let wal_before = fingerprint(&sidecar("-wal"));
+        let shm_before = fingerprint(&shm);
+        let started = std::time::Instant::now();
+        match AsyncConnection::open_strict_read_only_sync(path.to_str().unwrap()) {
+            Err(FrankenError::BusyRecovery) => {}
+            Err(other) => panic!("expected BusyRecovery, got {other}"),
+            Ok(_) => panic!("the strict open succeeded instead of refusing"),
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(fingerprint(&path), main_before);
+        assert_eq!(fingerprint(&sidecar("-wal")), wal_before);
+        assert_eq!(
+            fingerprint(&shm),
+            shm_before,
+            "a strict open never rewrites the -shm"
+        );
+
+        // Plain read-only keeps the 0.4.13 in-place rebuild.
+        let mut plain = AsyncConnection::open_with_flags_sync(
+            path.to_str().unwrap(),
+            OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .expect("plain read-only rebuilds a zeroed -shm");
+        let rows = plain.query_sync("SELECT count(*) FROM t").unwrap();
+        assert_eq!(
+            rows.first().and_then(|row| row.get(0)),
+            Some(&SqliteValue::Integer(12))
+        );
+        plain.close_sync().expect("close the plain reader");
+        assert_ne!(
+            fingerprint(&shm).0,
+            shm_before.0,
+            "plain 0.4.13 rewrites the -shm in place"
+        );
     }
 
     #[test]

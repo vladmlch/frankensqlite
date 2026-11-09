@@ -70,6 +70,30 @@ impl OpenFlags {
     /// accepted and ignored for API compatibility.
     pub const SQLITE_OPEN_EXRESCODE: Self = Self(0x0200_0000);
 
+    /// FrankenSQLite extension (bit `0x8000_0000`, never set by stock
+    /// `sqlite3_open_v2` masks): combined with
+    /// [`SQLITE_OPEN_READ_ONLY`](Self::SQLITE_OPEN_READ_ONLY), open the
+    /// database strictly read-only — the open and every operation on the
+    /// connection leave the whole database family of files (main database,
+    /// `-wal`, `-shm`, rollback journal, and any other sidecar) exactly as
+    /// found, creating no new file.
+    ///
+    /// The one behavioral difference from a plain
+    /// [`SQLITE_OPEN_READ_ONLY`](Self::SQLITE_OPEN_READ_ONLY) open is the
+    /// derived WAL index: a `-shm` that needs recovery to be read —
+    /// absent where the `-wal` still has committed frames, or present but
+    /// never initialized, zeroed, empty, torn, or garbage — is refused with
+    /// the typed `FrankenError::BusyRecovery` instead of being re-derived
+    /// onto the `-shm` on disk (which the plain read-only open does for a
+    /// present-but-uninitialized index since GH#528). A valid `-shm` is read
+    /// as-is without modification. Read
+    /// [`Connection::open_strict_read_only`] for the full contract.
+    ///
+    /// Setting this bit without `SQLITE_OPEN_READ_ONLY`, or together with
+    /// `SQLITE_OPEN_READ_WRITE`/`SQLITE_OPEN_CREATE` (including through a
+    /// `mode=rw`/`mode=rwc` URI), is rejected.
+    pub const SQLITE_OPEN_STRICT_READ_ONLY: Self = Self(0x8000_0000);
+
     const ACCESS_MODE_MASK: u32 =
         Self::SQLITE_OPEN_READ_ONLY.0 | Self::SQLITE_OPEN_READ_WRITE.0 | Self::SQLITE_OPEN_CREATE.0;
     const ACCEPTED_ANCILLARY_MASK: u32 = Self::SQLITE_OPEN_URI.0
@@ -77,7 +101,8 @@ impl OpenFlags {
         | Self::SQLITE_OPEN_FULL_MUTEX.0
         | Self::SQLITE_OPEN_SHARED_CACHE.0
         | Self::SQLITE_OPEN_PRIVATE_CACHE.0
-        | Self::SQLITE_OPEN_EXRESCODE.0;
+        | Self::SQLITE_OPEN_EXRESCODE.0
+        | Self::SQLITE_OPEN_STRICT_READ_ONLY.0;
     const SUPPORTED_MASK: u32 = Self::ACCESS_MODE_MASK | Self::ACCEPTED_ANCILLARY_MASK;
 
     /// Default flags: READ_WRITE | CREATE.
@@ -118,17 +143,28 @@ fn classify_access_mode(flags: OpenFlags) -> Result<OpenDisposition, FrankenErro
     let read_write = access_mode & OpenFlags::SQLITE_OPEN_READ_WRITE.0 != 0;
     let create = access_mode & OpenFlags::SQLITE_OPEN_CREATE.0 != 0;
 
-    match (read_only, read_write, create) {
-        (true, false, false) => Ok(OpenDisposition::ReadOnly),
-        (false, true, false) => Ok(OpenDisposition::WriteExisting),
-        (false, true, true) => Ok(OpenDisposition::WriteCreate),
-        _ => Err(FrankenError::TypeMismatch {
-            expected:
-                "one of SQLITE_OPEN_READ_ONLY, SQLITE_OPEN_READ_WRITE, or SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_CREATE"
-                    .into(),
+    let disposition = match (read_only, read_write, create) {
+        (true, false, false) => OpenDisposition::ReadOnly,
+        (false, true, false) => OpenDisposition::WriteExisting,
+        (false, true, true) => OpenDisposition::WriteCreate,
+        _ => {
+            return Err(FrankenError::TypeMismatch {
+                expected:
+                    "one of SQLITE_OPEN_READ_ONLY, SQLITE_OPEN_READ_WRITE, or SQLITE_OPEN_READ_WRITE | SQLITE_OPEN_CREATE"
+                        .into(),
+                actual: format!("open flags 0x{:x}", flags.0),
+            })
+        }
+    };
+    if flags.contains(OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY)
+        && disposition != OpenDisposition::ReadOnly
+    {
+        return Err(FrankenError::TypeMismatch {
+            expected: "SQLITE_OPEN_STRICT_READ_ONLY combined with SQLITE_OPEN_READ_ONLY".into(),
             actual: format!("open flags 0x{:x}", flags.0),
-        }),
+        });
     }
+    Ok(disposition)
 }
 
 fn validate_open_flags(flags: OpenFlags) -> Result<(), FrankenError> {
@@ -174,6 +210,10 @@ fn validate_open_flags(flags: OpenFlags) -> Result<(), FrankenError> {
 struct ResolvedOpen<'a> {
     path: Cow<'a, str>,
     disposition: OpenDisposition,
+    /// `SQLITE_OPEN_STRICT_READ_ONLY` was requested; valid only with the
+    /// read-only disposition (enforced after URI resolution, so a `mode=rw`
+    /// URI cannot launder a strict request into a writable open).
+    strict_read_only: bool,
 }
 
 fn uri_error(detail: impl Into<String>) -> FrankenError {
@@ -312,6 +352,7 @@ fn resolve_uri_query(
 
 fn resolve_open(path: &str, flags: OpenFlags) -> Result<ResolvedOpen<'_>, FrankenError> {
     let disposition = classify_access_mode(flags)?;
+    let strict_read_only = flags.contains(OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY);
     if path.as_bytes().contains(&0) {
         return Err(uri_error("NUL byte in database filename"));
     }
@@ -322,6 +363,7 @@ fn resolve_open(path: &str, flags: OpenFlags) -> Result<ResolvedOpen<'_>, Franke
         return Ok(ResolvedOpen {
             path: Cow::Borrowed(path),
             disposition,
+            strict_read_only,
         });
     };
 
@@ -371,22 +413,37 @@ fn resolve_open(path: &str, flags: OpenFlags) -> Result<ResolvedOpen<'_>, Franke
             filename = Cow::Owned(filename[1..].to_owned());
         }
     }
+    if strict_read_only && disposition != OpenDisposition::ReadOnly {
+        return Err(FrankenError::TypeMismatch {
+            expected: "SQLITE_OPEN_STRICT_READ_ONLY combined with SQLITE_OPEN_READ_ONLY".into(),
+            actual: format!(
+                "open flags 0x{:x} resolved to a writable disposition",
+                flags.0
+            ),
+        });
+    }
     Ok(ResolvedOpen {
         path: filename,
         disposition,
+        strict_read_only,
     })
 }
 
 async fn open_read_only_connection_with_env(
     path: &str,
     env: ConnectionEnv,
+    strict_read_only: bool,
 ) -> Result<Connection, FrankenError> {
     if path == ":memory:" {
         return Err(FrankenError::NotImplemented(
             "read-only :memory: connections are not supported".to_owned(),
         ));
     }
-    Connection::open_schema_only_with_env(path, env).await
+    if strict_read_only {
+        Connection::open_strict_read_only_with_env(path, env).await
+    } else {
+        Connection::open_schema_only_with_env(path, env).await
+    }
 }
 
 impl std::ops::BitOr for OpenFlags {
@@ -419,6 +476,13 @@ impl std::ops::BitOr for OpenFlags {
 /// across a repeated `mode=memory`) are refused. URI handling here applies to
 /// this open, not subsequent SQL ATTACH statements or direct core constructors.
 ///
+/// `SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_STRICT_READ_ONLY` selects the strict
+/// read-only open (see [`OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY`] and
+/// [`Connection::open_strict_read_only`]): the whole database family of files
+/// stays byte- and mtime-identical and no new file appears; a WAL index that
+/// needs recovery to be read is refused with the typed
+/// `FrankenError::BusyRecovery` rather than rebuilt onto the `-shm`.
+///
 /// # Examples
 ///
 /// ```ignore
@@ -430,6 +494,24 @@ pub async fn open_with_flags(path: &str, flags: OpenFlags) -> Result<Connection,
     open_with_flags_with_env(path, flags, ConnectionEnv::default()).await
 }
 
+/// Strict read-only open through the compat layer (cass FAD contract).
+///
+/// Equivalent to
+/// `open_with_flags(path, SQLITE_OPEN_READ_ONLY | SQLITE_OPEN_STRICT_READ_ONLY)`
+/// and to [`Connection::open_strict_read_only`]: the open and every
+/// operation on the connection leave the database, `-wal`, `-shm`, and every
+/// other sidecar byte- and mtime-identical, creating no new file; a WAL
+/// index that needs recovery to be read is refused with the typed
+/// [`FrankenError::BusyRecovery`] so the caller can fall back to a private
+/// snapshot copy.
+pub async fn open_strict_read_only(path: &str) -> Result<Connection, FrankenError> {
+    open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
+    )
+    .await
+}
+
 // `pub`, not `pub(crate)`: the enclosing `flags` module is private, so `pub`
 // already limits this to the crate; `pub(crate)` here trips
 // `clippy::redundant_pub_crate` and breaks the workspace `-D warnings` gate.
@@ -439,9 +521,12 @@ pub async fn open_with_flags_with_env(
     env: ConnectionEnv,
 ) -> Result<Connection, FrankenError> {
     let resolved = resolve_open(path, flags)?;
+    let strict_read_only = resolved.strict_read_only;
     let path = resolved.path.as_ref();
     match resolved.disposition {
-        OpenDisposition::ReadOnly => open_read_only_connection_with_env(path, env).await,
+        OpenDisposition::ReadOnly => {
+            open_read_only_connection_with_env(path, env, strict_read_only).await
+        }
         OpenDisposition::WriteExisting => {
             if path == ":memory:" {
                 Connection::open_with_env(path, env).await
@@ -569,6 +654,67 @@ mod tests {
         )
         .expect_err("conflicting cache-mode flags should be rejected explicitly");
         assert!(matches!(error, FrankenError::TypeMismatch { .. }));
+    }
+
+    #[test]
+    fn strict_read_only_flag_requires_the_read_only_access_mode() {
+        for flags in [
+            OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
+            OpenFlags::default_flags() | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY,
+        ] {
+            let error = classify_access_mode(flags).expect_err(
+                "SQLITE_OPEN_STRICT_READ_ONLY without SQLITE_OPEN_READ_ONLY must be rejected",
+            );
+            assert!(
+                matches!(error, FrankenError::TypeMismatch { .. }),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            classify_access_mode(
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY
+            )
+            .unwrap(),
+            OpenDisposition::ReadOnly
+        );
+    }
+
+    #[test]
+    fn strict_read_only_flag_survives_only_a_read_only_uri_resolution() {
+        let strict_ro = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_STRICT_READ_ONLY;
+        let resolved = resolve_open("file:a.db?mode=ro", strict_ro | OpenFlags::SQLITE_OPEN_URI)
+            .expect("mode=ro keeps a strict read-only request readable");
+        assert!(resolved.strict_read_only);
+        assert_eq!(resolved.disposition, OpenDisposition::ReadOnly);
+        // A strict request is refused before it can widen: the pre-existing URI
+        // narrowing guard (a read-only flags request may only stay read-only)
+        // rejects every writable mode= query. The post-URI strict check in
+        // resolve_open is a redundant backstop; the narrowing guard always
+        // fires first for these queries.
+        for query in ["mode=rw", "mode=rwc", "mode=rw&mode=ro"] {
+            let error = resolve_open(
+                &format!("file:a.db?{query}"),
+                strict_ro | OpenFlags::SQLITE_OPEN_URI,
+            )
+            .expect_err("a strict read-only request must not widen to a writable open");
+            let detail = match error {
+                FrankenError::FunctionError(detail) => detail,
+                other => panic!("{query}: expected the URI narrowing refusal, got {other}"),
+            };
+            assert!(
+                detail.contains("access mode not allowed"),
+                "{query}: {detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_flags_never_become_strict_read_only() {
+        for flags in [OpenFlags::SQLITE_OPEN_READ_ONLY, OpenFlags::default_flags()] {
+            let resolved = resolve_open("a.db", flags).unwrap();
+            assert!(!resolved.strict_read_only);
+        }
     }
 
     #[test]
