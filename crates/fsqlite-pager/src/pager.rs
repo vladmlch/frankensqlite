@@ -7730,6 +7730,13 @@ enum PagerAccessMode {
     Writable,
     ReadOnly,
     ReadOnlyWithWalIndexRecovery,
+    /// Read-only with a never-write guarantee for the whole database family:
+    /// this pager must not create or modify any sidecar, so it never rebuilds
+    /// a WAL index in place. A WAL index that needs recovery to be read is
+    /// refused with `BusyRecovery` exactly like the pre-GH#528 plain
+    /// read-only pager, instead of being re-derived onto the `-shm`
+    /// (see [`Self::ReadOnly`]).
+    StrictReadOnly,
 }
 
 impl PagerAccessMode {
@@ -14530,6 +14537,10 @@ pub enum ConnectionPagerOpenMode {
     ReadOnly(Option<FileIdentity>),
     /// Read-only database/WAL access with explicit derived WAL-index recovery.
     ReadOnlyWithWalIndexRecovery(Option<FileIdentity>),
+    /// Open an existing database read-only with a never-write guarantee for
+    /// the whole database family: no sidecar may be created or modified, so
+    /// WAL-index recovery is refused with `BusyRecovery` rather than rebuilt.
+    StrictReadOnly(Option<FileIdentity>),
 }
 
 impl<V: Vfs> traits::sealed::Sealed for SimplePager<V> {}
@@ -18736,7 +18747,10 @@ where
                 traits::WalNativeReadOutcome::Ready => return Ok(()),
                 traits::WalNativeReadOutcome::RecoveryRequired(reason) => reason,
             };
-            let read_only = inner.access_mode == PagerAccessMode::ReadOnly;
+            let read_only = matches!(
+                inner.access_mode,
+                PagerAccessMode::ReadOnly | PagerAccessMode::StrictReadOnly
+            );
             // A stale-marks index never clears for a pager that may not
             // rebuild it; answer like SQLITE_READONLY_RECOVERY instead of a
             // retryable busy that callers spin on forever (GH#430).
@@ -18750,7 +18764,10 @@ where
             // existing index found uninitialized under every recovery fence,
             // as stock does from any connection that can write `-shm`. It
             // never creates a missing `-shm` or rewrites an initialized index.
+            // A strict read-only pager never rewrites any file, so it keeps
+            // the pre-GH#528 answer for every recovery class: `BusyRecovery`.
             let uninitialized_only = read_only
+                && inner.access_mode != PagerAccessMode::StrictReadOnly
                 && matches!(
                     reason,
                     traits::WalNativeRecoveryReason::SharedIndexUnavailable
@@ -19095,7 +19112,8 @@ where
                 .await
             }
             ConnectionPagerOpenMode::ReadOnly(expected_identity)
-            | ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity) => {
+            | ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(expected_identity)
+            | ConnectionPagerOpenMode::StrictReadOnly(expected_identity) => {
                 let pager = Self::open_readonly_with_optional_expected_identity(
                     cx,
                     vfs,
@@ -19106,10 +19124,18 @@ where
                     false,
                 )
                 .await?;
-                if matches!(mode, ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(_)) {
-                    pager.inner.lock()
-                        .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?
-                        .access_mode = PagerAccessMode::ReadOnlyWithWalIndexRecovery;
+                match mode {
+                    ConnectionPagerOpenMode::ReadOnlyWithWalIndexRecovery(_) => {
+                        pager.inner.lock()
+                            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?
+                            .access_mode = PagerAccessMode::ReadOnlyWithWalIndexRecovery;
+                    }
+                    ConnectionPagerOpenMode::StrictReadOnly(_) => {
+                        pager.inner.lock()
+                            .map_err(|_| FrankenError::internal("SimplePager lock poisoned"))?
+                            .access_mode = PagerAccessMode::StrictReadOnly;
+                    }
+                    _ => {}
                 }
                 Ok(pager)
             }

@@ -3181,9 +3181,10 @@ pub fn codegen_select(
     // bd-nonagg-rowid-range-residual: `rowid <range> AND <residual>` — walk only the [lower, upper] slice
     // (rowid order = full-scan order) and re-apply the whole WHERE per row, instead of full-scanning. The
     // bare range (no residual) is owned by `rowid_range` above; this handles ONLY the conjunction case
-    // (`has_residual`). Gated so nothing before the residual filter emits a placeholder (the
-    // detector already requires integer-literal bounds), keeping the residual `?` numbering
-    // trivial: no LIMIT, or an integer-literal LIMIT and OFFSET (bd-qdve2: the keyset page
+    // (`has_residual`). Gated so nothing before the residual filter emits a placeholder, keeping the
+    // residual `?` numbering exact: the detector requires integer-literal or numbered-placeholder
+    // bounds and, when a bound is numbered, rejects any anonymous/named placeholder in the WHERE;
+    // LIMIT must be absent or an integer-literal LIMIT and OFFSET (bd-qdve2: the keyset page
     // `rowid > N AND <filter> LIMIT n`).
     let limit_is_literal = stmt.limit.as_ref().is_none_or(|clause| {
         matches!(clause.limit, Expr::Literal(Literal::Integer(_), _))
@@ -3246,6 +3247,85 @@ pub fn codegen_select(
                 Some((col_name, idx, range))
             },
         )
+    };
+    // glm-range-residual: `WHERE <indexed col> <range> AND <residual>` — walk the
+    // single-column index's [lower, upper] key slice and re-apply the WHOLE WHERE per row,
+    // instead of declining to a full scan the moment the WHERE carries any other conjunct
+    // (the motivating shape: `key >= ? AND key < ? AND value IS NOT NULL` on a UNIQUE text
+    // key — a 0.7-1.2s full scan for a seek-sized range). The bare `index_range` above owns
+    // pure ranges; this fires only when that extraction declined BECAUSE of the extra
+    // conjuncts. Mirrors `eq_residual`'s gating: numbered placeholders only (WHERE and
+    // LIMIT alike), because the emitter emits the LIMIT registers FIRST and the filter
+    // re-emits the whole WHERE — an anonymous/named slot would renumber and collide. The
+    // connection canonicalizes every bind to `?NNN`, so plain `?` users reach the numbered
+    // form; raw anonymous/named ASTs keep the correct (just slower) full scan. Rowid paths
+    // outrank this (a contiguous rowid slice beats per-entry `IdxRowid`+`SeekRowid`
+    // lookups), and ORDER BY must be servable by the (col, rowid) walk order exactly like
+    // the bare path.
+    let index_range_residual: Option<(&IndexSchema, ColumnRangeTarget<'_>)> = if is_aggregate
+        || from_index_hint.is_some()
+        || time_travel.is_some()
+        || distinct != Distinctness::All
+        || !group_by.is_empty()
+        || having.is_some()
+        || has_window_columns(columns)
+        || table.without_rowid
+        || index_range.is_some()
+        || rowid_range.is_some()
+        || rowid_range_residual.is_some()
+        || where_clause
+            .as_deref()
+            .is_some_and(expr_contains_non_numbered_placeholder)
+        || stmt.limit.as_ref().is_some_and(|clause| {
+            expr_contains_non_numbered_placeholder(&clause.limit)
+                || clause
+                    .offset
+                    .as_ref()
+                    .is_some_and(expr_contains_non_numbered_placeholder)
+        })
+    {
+        None
+    } else {
+        where_clause.as_deref().and_then(|where_expr| {
+            // Find the single-column ascending index whose key column carries the range;
+            // extract that range (ignoring the other conjuncts) and require at least one
+            // residual conjunct — a pure range is the bare path's, and it already declined.
+            table.indexes.iter().find_map(|idx| {
+                let index_col = idx.columns.first()?;
+                if !idx.supports_direct_column_lookup()
+                    || idx.key_term_count() != 1
+                    || idx.key_term_descending(0)
+                {
+                    return None;
+                }
+                let range =
+                    extract_named_column_range(where_expr, table, table_alias, index_col)?;
+                if !where_column_range_has_residual_conjunct(
+                    where_expr,
+                    table,
+                    table_alias,
+                    index_col,
+                ) {
+                    return None;
+                }
+                if !stmt.order_by.is_empty()
+                    && !range_order_by_is_deterministic(
+                        index_col,
+                        &stmt.order_by,
+                        table,
+                        table_alias,
+                        idx.is_unique,
+                        false,
+                    )
+                {
+                    return None;
+                }
+                if !index_range_fast_path_is_safe(table, table_alias, schema, index_col, &range) {
+                    return None;
+                }
+                Some((idx, range))
+            })
+        })
     };
     // Check for a simple indexed equality probe (only for non-aggregate queries).
     // We probe with [bound_value, i64::MIN] so SeekGE anchors on the first
@@ -3979,6 +4059,40 @@ pub fn codegen_select(
             end_label,
             idx_schema,
             planner_index_range_target_from_column_range(range),
+            None,
+            false,
+        );
+    }
+
+    // glm-range-residual: same pre-directive hoist as the covering one above, but for
+    // `col <range> AND <residual>` — the planner still models nothing seekable (a
+    // FullTableScan directive), which would full-scan every row. The residual walk visits
+    // only the index's [lower, upper] key slice and re-applies the whole WHERE per row; the
+    // row set is byte-identical to the full scan, so no covering gate (the residual may read
+    // any table column — every entry is dereferenced via `IdxRowid` + `SeekRowid`, mirroring
+    // the eq-residual and rowid-residual walks).
+    if let Some((idx_schema, range)) = index_range_residual.as_ref()
+        && ctx.planner_select_directive.as_ref().is_some_and(|d| {
+            d.table_name.eq_ignore_ascii_case(&table.name)
+                && matches!(d.access_kind, PlannerSelectAccessKind::FullTableScan)
+        })
+    {
+        return codegen_select_index_range_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            idx_schema,
+            planner_index_range_target_from_column_range(range),
+            where_clause.as_deref(),
+            true,
         );
     }
 
@@ -4594,6 +4708,8 @@ pub fn codegen_select(
                                                 end_label,
                                                 idx_schema,
                                                 directive_range_target.clone(),
+                                                None,
+                                                false,
                                             );
                                         }
                                         Some(_) => Some("index_range_target_mismatch"),
@@ -4630,6 +4746,8 @@ pub fn codegen_select(
                                         end_label,
                                         idx_schema,
                                         planner_index_range_target_from_column_range(range_target),
+                                        None,
+                                        false,
                                     );
                                 }
                             } else {
@@ -4743,6 +4861,29 @@ pub fn codegen_select(
             end_label,
             idx_schema,
             planner_index_range_target_from_column_range(&index_range),
+            None,
+            false,
+        )
+    } else if let Some((idx_schema, range)) = index_range_residual {
+        // glm-range-residual: the directive bypassed (a range with extra conjuncts is
+        // not modeled as seekable) or none was emitted — walk the index range slice and
+        // re-apply the whole WHERE per row instead of full-scanning.
+        codegen_select_index_range_scan(
+            b,
+            cursor,
+            table,
+            table_alias,
+            schema,
+            columns,
+            stmt.limit.as_ref(),
+            out_regs,
+            out_col_count,
+            done_label,
+            end_label,
+            idx_schema,
+            planner_index_range_target_from_column_range(&range),
+            where_clause.as_deref(),
+            true,
         )
     } else if let Some((idx_schema, target_expr)) = heuristic_index_eq.filter(|_| {
         // bd-nonagg-index-eq-order-rowid: the index-equality seek returns rows in index-key order — for a
@@ -6915,8 +7056,9 @@ fn codegen_select_rowid_range_scan(
     // `rowid <range> AND <residual>`. The walk visits the `[lower, upper]` slice (a superset of the
     // matches) in rowid order; the residual narrows it. Byte-identical to the full scan (same rows, same
     // order, fewer visited). `false` for the plain-range callers → byte-identical. The residual hoist
-    // requires integer-literal bounds and LIMIT/OFFSET, so nothing before the filter emits a
-    // placeholder. bd-nonagg-rowid-range-residual.
+    // requires integer-literal or numbered-placeholder bounds (a numbered bound also rejects
+    // anonymous/named placeholders in the WHERE), and a literal-only-or-absent LIMIT/OFFSET, so
+    // nothing before the filter emits an anonymous placeholder. bd-nonagg-rowid-range-residual.
     residual_filter: bool,
 ) -> Result<(), CodegenError> {
     // Captured before any placeholder-emitting op so the re-applied WHERE re-numbers a residual `?` from
@@ -7103,7 +7245,22 @@ fn codegen_select_index_range_scan(
     end_label: crate::Label,
     idx_schema: &IndexSchema,
     index_range: PlannerIndexRangeTarget,
+    where_clause: Option<&Expr>,
+    // When true, the full `where_clause` is applied as a per-row residual filter inside the
+    // walk — for `<indexed col> <range> AND <residual>` (glm-range-residual). The walk
+    // visits the [lower, upper] key slice (a superset of the matches) in (col, rowid) order;
+    // the residual re-applies the WHOLE WHERE and narrows to the exact full-scan row set.
+    // Detection admits only numbered placeholders (WHERE and LIMIT alike), so re-emitting the
+    // whole WHERE cannot mis-number a slot even though the LIMIT registers emit first. The
+    // covering fast path is disabled — the residual may read any table column, so every entry
+    // is dereferenced via `IdxRowid` + `SeekRowid`, mirroring the eq-residual and rowid-residual
+    // walks. `None, false` for the bare-range callers → byte-identical.
+    residual_filter: bool,
 ) -> Result<(), CodegenError> {
+    // Captured before any placeholder-emitting op (the LIMIT registers emit first) so the
+    // re-applied WHERE re-numbers a residual `?` from this base. Unused when
+    // `residual_filter` is false.
+    let where_placeholder_base = b.current_anon_placeholder();
     let idx_cursor = cursor + 1;
     let (limit_reg, offset_reg) = emit_limit_offset_registers(b, limit_clause, done_label);
 
@@ -7171,7 +7328,7 @@ fn codegen_select_index_range_scan(
     } else {
         None
     };
-    let covering_output = if wr_pk_indices.is_some() {
+    let covering_output = if wr_pk_indices.is_some() || residual_filter {
         None
     } else {
         resolve_covering_output_sources(columns, table, table_alias, idx_schema)
@@ -7281,6 +7438,24 @@ fn codegen_select_index_range_scan(
                 skip_label,
                 P4::None,
                 0,
+            );
+        }
+
+        // glm-range-residual: narrow the walked key slice with the WHOLE WHERE. A residual
+        // miss jumps to `skip_label` (the Next), so the walk continues to the next entry.
+        // Applied after `SeekRowid` (the filter reads table columns) and before the OFFSET
+        // count so OFFSET skips only matching rows. Detection admits numbered placeholders
+        // only, so the reset re-numbers nothing that the probes already emitted.
+        if residual_filter && let Some(where_expr) = where_clause {
+            b.set_next_anon_placeholder(where_placeholder_base);
+            emit_where_filter(
+                b,
+                where_expr,
+                cursor,
+                table,
+                table_alias,
+                schema,
+                skip_label,
             );
         }
 
@@ -27712,15 +27887,25 @@ fn index_eq_residual_seek_target<'a, 't>(
 type IndexEqSeekTarget<'a, 't> = (&'t IndexSchema, Vec<(&'a Expr, char)>, bool);
 
 /// [`index_eq_residual_seek_target`], extended (GH#434) to an index whose
-/// every key column is pinned by an equality with a literal, a numbered or
-/// named parameter, or a constant expression over those (bd-aavtp), such as
-/// the autoindex of a composite PRIMARY KEY.
+/// key columns are pinned by an equality with a literal, a numbered or named
+/// parameter, or a constant expression over those (bd-aavtp), such as the
+/// autoindex of a composite PRIMARY KEY — and (bd-j9gub) to a PREFIX of
+/// those columns: `WHERE a = 3` on `(a, b)` seeks the pinned `a = 3` block
+/// instead of full-scanning.
 ///
-/// Only the full key qualifies: the probe `(v1, ..., vn, i64::MIN)` then
-/// compares its trailing field with the rowid. After a partial prefix it
-/// would compare with the next key column, where NULLs sort first. TEXT key
-/// columns must compare BINARY in both the index and the column, as for
-/// the single-column seek.
+/// The longest pinned prefix across the table's indexes wins (narrowest
+/// block); ties keep schema order. A pinned term must be ASC (the collect
+/// walks ascending) and carry an admitted affinity — INTEGER/NUMERIC/REAL
+/// or BINARY-collated TEXT on both the index term and the column — so the
+/// first DESC, NOCASE-text or untyped term ends the prefix there. Terms
+/// after the prefix never constrain the probe: the record comparator sorts
+/// a k-field probe before every entry that extends it, so `SeekGE` lands on
+/// the block start and the per-column equality walk ends the block — a
+/// trailing NULL-able or DESC term cannot displace the probe.
+///
+/// The full-key probe `(v1, ..., vn, i64::MIN)` keeps comparing its trailing
+/// field with the rowid, byte-identical to GH#434; a partial prefix uses
+/// the bare `(v1, ..., vk)` record (see [`emit_index_eq_rowset_collect`]).
 fn index_key_eq_residual_seek_target<'a, 't>(
     where_clause: Option<&'a Expr>,
     table: &'t TableSchema,
@@ -27745,51 +27930,80 @@ fn index_key_eq_residual_seek_target<'a, 't>(
         })
         .filter(|(_, target, _)| is_rowid_range_constant(target))
         .collect();
-    table
+    let mut best: Option<IndexEqSeekTarget<'a, 't>> = None;
+    for idx in table
         .indexes
         .iter()
         .filter(|idx| idx.supports_direct_column_lookup() && idx.key_term_count() >= 2)
-        .find_map(|idx| {
-            let mut targets = Vec::with_capacity(idx.key_term_count());
-            let mut consumed = Vec::with_capacity(idx.key_term_count());
-            for (term, column_name) in idx.columns.iter().enumerate() {
-                if idx.key_term_descending(term) {
-                    return None;
-                }
-                let (_, target, conjunct) = equalities
-                    .iter()
-                    .find(|(name, _, _)| name.eq_ignore_ascii_case(column_name))?;
-                if !consumed.contains(conjunct) {
-                    consumed.push(*conjunct);
-                }
-                let column = table.columns.get(table.column_index(column_name)?)?;
-                let affinity = column.affinity;
-                if !matches!(affinity, 'D' | 'C' | 'E' | 'B') {
-                    return None;
-                }
-                let binary = |collation: Option<&str>| {
-                    collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
-                };
-                if affinity == 'B'
-                    && !(binary(idx.key_term_collation(term)) && binary(column.collation.as_deref()))
-                {
-                    return None;
-                }
-                targets.push((*target, affinity));
+    {
+        let mut targets = Vec::with_capacity(idx.key_term_count());
+        let mut consumed = Vec::with_capacity(idx.key_term_count());
+        for (term, column_name) in idx.columns.iter().enumerate() {
+            // A term that cannot join the probe (DESC, unpinned, wrong
+            // affinity, non-BINARY text) ends the prefix here; the terms
+            // pinned so far still form a seekable block.
+            if idx.key_term_descending(term) {
+                break;
             }
-            // An index can repeat a column (`(a, a)`), so one conjunct may
-            // feed several key terms. The WHERE is fully enforced by the seek
-            // only when every conjunct fed a key term; otherwise the leftover
-            // terms (a gate, a contradictory `a = 2`) run as a residual.
-            Some((idx, targets, consumed.len() < conjuncts.len()))
-        })
+            let Some((_, target, conjunct)) = equalities
+                .iter()
+                .find(|(name, _, _)| name.eq_ignore_ascii_case(column_name))
+            else {
+                break;
+            };
+            let Some(column) = table
+                .column_index(column_name)
+                .and_then(|column| table.columns.get(column))
+            else {
+                // A key column absent from the table is schema corruption,
+                // not a prefix boundary: decline this index whole.
+                targets.clear();
+                break;
+            };
+            let affinity = column.affinity;
+            if !matches!(affinity, 'D' | 'C' | 'E' | 'B') {
+                break;
+            }
+            let binary = |collation: Option<&str>| {
+                collation.is_none_or(|c| c.eq_ignore_ascii_case("BINARY"))
+            };
+            if affinity == 'B'
+                && !(binary(idx.key_term_collation(term)) && binary(column.collation.as_deref()))
+            {
+                break;
+            }
+            if !consumed.contains(conjunct) {
+                consumed.push(*conjunct);
+            }
+            targets.push((*target, affinity));
+        }
+        if targets.is_empty() {
+            continue;
+        }
+        // An index can repeat a column (`(a, a)`), so one conjunct may
+        // feed several key terms. The WHERE is fully enforced by the seek
+        // only when every conjunct fed a key term; otherwise the leftover
+        // terms (a gate, a range, a contradictory `a = 2`) run as a residual.
+        let candidate = (idx, targets, consumed.len() < conjuncts.len());
+        let narrows = best
+            .as_ref()
+            .is_none_or(|(_, best_targets, _)| candidate.1.len() > best_targets.len());
+        if narrows {
+            best = Some(candidate);
+        }
+    }
+    best
 }
 
-/// DELETE/UPDATE Pass-1 collection for `WHERE <single-col-ASC-integer-indexed> = <value> [AND
-/// <residual>]`: open a FRESH read cursor on the index (distinct from the table cursor and the registered
-/// index-maintenance cursors, so Pass 2 is unaffected), seek `(val, i64::MIN)`, walk the equal-value run
-/// adding each rowid to the RowSet, then close the cursor. The probe is coerced to the column's 'D'
-/// affinity (`Opcode::Affinity`) when it is not already a numeric literal — so a runtime-typed placeholder
+/// DELETE/UPDATE Pass-1 collection for `WHERE <indexed cols> = <values> [AND <residual>]`: open a
+/// FRESH read cursor on the index (distinct from the table cursor and the registered
+/// index-maintenance cursors, so Pass 2 is unaffected), seek, walk the equal-value run
+/// adding each rowid to the RowSet, then close the cursor. A full-key probe seeks
+/// `(v1, ..., vn, i64::MIN)` (GH#434); a PREFIX probe (bd-j9gub) seeks the bare
+/// `(v1, ..., vk)` record — the record comparator sorts a shorter record before every
+/// entry that extends it, so `SeekGE` lands on the block start without padding the
+/// unconstrained trailing terms. The probe is coerced to the column's affinity
+/// (`Opcode::Affinity`) when it is not already a matching literal — so a runtime-typed placeholder
 /// bound seeks identically to the full-scan filter and the seek is authoritative (no affinity fallback).
 /// When `residual_filter` is true, each candidate is positioned on the table cursor and the full WHERE is
 /// applied before `RowSetAdd` (no covering decision in a DML collect — the row is always read). Control
@@ -27800,9 +28014,10 @@ fn emit_index_eq_rowset_collect(
     b: &mut ProgramBuilder,
     idx_read_cursor: i32,
     idx_schema: &IndexSchema,
-    // One probe value per leading key column, with that column's affinity ('D' integer / 'C' numeric /
-    // 'E' real / 'B' binary-text) — coerced onto a runtime-typed probe so it seeks like the
-    // affinity-applying comparison would. More than one entry covers the index's full key (GH#434).
+    // One probe value per pinned leading key column, with that column's affinity ('D' integer / 'C'
+    // numeric / 'E' real / 'B' binary-text) — coerced onto a runtime-typed probe so it seeks like the
+    // affinity-applying comparison would. Pinning every key column is the GH#434 full-key seek;
+    // pinning a leading subset (bd-j9gub) is a prefix seek with no i64::MIN rowid floor.
     targets: &[(&Expr, char)],
     rowset_reg: i32,
     rowid_reg: i32,
@@ -27819,7 +28034,15 @@ fn emit_index_eq_rowset_collect(
 ) {
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     let key_count = targets.len() as i32;
-    let probe_key_regs = b.alloc_regs(key_count + 1);
+    // bd-j9gub: a probe covering fewer columns than the index key is a true k-field
+    // prefix record — no i64::MIN pad. Padding the unconstrained trailing terms is not
+    // a block floor when such a term can hold NULL (NULL sorts before every integer,
+    // so the pad would position past real block entries), while the record comparator
+    // already sorts a k-field probe before every entry that extends it. The full-key
+    // probe keeps its `(v1, ..., vn, i64::MIN)` rowid floor, byte-identical to GH#434.
+    let prefix_probe = targets.len() < idx_schema.key_term_count();
+    let probe_field_count = key_count + i32::from(!prefix_probe);
+    let probe_key_regs = b.alloc_regs(probe_field_count);
     let min_rowid_reg = probe_key_regs + key_count;
     // Emit the probe values, numbering an anon placeholder from the base, and coerce a runtime-typed bound
     // to the column's affinity so the seek positions like the affinity-applying comparison would.
@@ -27837,12 +28060,14 @@ fn emit_index_eq_rowset_collect(
             );
         }
     }
-    b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+    if !prefix_probe {
+        b.emit_op(Opcode::Int64, 0, min_rowid_reg, 0, P4::Int64(i64::MIN), 0);
+    }
     let probe_record_reg = b.alloc_reg();
     b.emit_op(
         Opcode::MakeRecord,
         probe_key_regs,
-        key_count + 1,
+        probe_field_count,
         probe_record_reg,
         P4::None,
         0,
@@ -27919,8 +28144,9 @@ fn emit_index_eq_rowset_collect(
 /// Generate VDBE bytecode for a DELETE statement.
 ///
 /// Uses a two-pass plan: collect exact matching rowids without mutating the table, then revisit those
-/// rowids to maintain indexes, emit `RETURNING`, and delete. Equality, literal-IN, and lower-bounded
-/// literal-range predicates use direct seeks; all other predicates use the general filtered table scan.
+/// rowids to maintain indexes, emit `RETURNING`, and delete. Equality (over a rowid, a full index key,
+/// or a PREFIX of an index's key columns — bd-j9gub), literal-IN, and lower-bounded literal-range
+/// predicates use direct seeks; all other predicates use the general filtered table scan.
 pub fn codegen_delete(
     b: &mut ProgramBuilder,
     stmt: &DeleteStatement,
@@ -35540,14 +35766,38 @@ fn extract_rowid_range_residual_target<'a>(
     if target.lower.is_none() && target.upper.is_none() {
         return None;
     }
-    // The seek probe emits the bound values, so require integer-LITERAL bounds: then it emits no
-    // anonymous placeholders and a `?` can appear only in the residual, where the filter numbers it
-    // identically to the scan path (bd-agg-param-residual). A placeholder bound (`id > ?`) declines.
-    let literal_bound = |b: &Option<RowidRangeBound<'a>>| {
-        b.as_ref()
-            .is_none_or(|bound| matches!(bound.expr, Expr::Literal(Literal::Integer(_), _)))
+    // The seek probe emits the bound values, so bounds must be integer LITERALS or NUMBERED
+    // placeholders. A literal emits no placeholder at all, so a `?` can appear only in the
+    // residual, where the filter numbers it identically to the scan path (bd-agg-param-residual).
+    // A NUMBERED bound emits a position-independent `Variable n` (numbered placeholders never
+    // consume the anonymous counter), so the probe emission cannot shift the residual's numbering
+    // either — but then the WHERE must contain NO anonymous/named placeholder at all: the filter
+    // re-applies the whole WHERE, and re-numbering an anonymous/named slot from the captured base
+    // could collide with the probe's slots (`id > ?1 AND v = ?` would re-emit the residual `?` as
+    // slot 1). The connection canonicalizes every bind to `?NNN`, so plain `?` users reach the
+    // numbered form; other raw shapes keep the correct (just slower) full scan.
+    let seek_safe_bound = |b: &Option<RowidRangeBound<'a>>| {
+        b.as_ref().is_none_or(|bound| {
+            matches!(
+                bound.expr,
+                Expr::Literal(Literal::Integer(_), _)
+                    | Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
+            )
+        })
     };
-    if !literal_bound(&target.lower) || !literal_bound(&target.upper) {
+    if !seek_safe_bound(&target.lower) || !seek_safe_bound(&target.upper) {
+        return None;
+    }
+    let has_numbered_placeholder_bound = [target.lower.as_ref(), target.upper.as_ref()]
+        .into_iter()
+        .flatten()
+        .any(|bound| {
+            matches!(
+                bound.expr,
+                Expr::Placeholder(fsqlite_ast::PlaceholderType::Numbered(_), _)
+            )
+        });
+    if has_numbered_placeholder_bound && expr_contains_non_numbered_placeholder(expr) {
         return None;
     }
     rowid_range_fast_path_is_safe(target).then_some((target, true))
@@ -36466,6 +36716,45 @@ fn extract_named_column_range<'a>(
         }
     }
     (target.lower.is_some() || target.upper.is_some()).then_some(target)
+}
+
+/// Whether `where_expr` contains at least one conjunct that is NOT a range term on `column`
+/// — i.e. a `column`-range seek would visit rows the whole WHERE still has to filter. The
+/// classification mirrors [`extract_named_column_range`]: a BinaryOp comparison that
+/// extracts a bound on `column`, or a non-`NOT` BETWEEN on `column` with range-constant
+/// endpoints. Anything else — an equality (the `eq_residual` path's domain), a comparison on
+/// a different column, IS NULL, an arbitrary expression, an OR — is a residual. A
+/// misclassification in the conservative direction only costs a redundant per-row check
+/// (the residual re-applies the whole WHERE anyway), never correctness.
+fn where_column_range_has_residual_conjunct(
+    where_expr: &Expr,
+    table: &TableSchema,
+    table_alias: Option<&str>,
+    column: &str,
+) -> bool {
+    let mut conjuncts = Vec::new();
+    collect_conjunctive_terms(where_expr, &mut conjuncts);
+    conjuncts.into_iter().any(|term| match term {
+        Expr::BinaryOp {
+            left, op, right, ..
+        } => {
+            !extract_column_range_bound(left, *op, right, table, table_alias)
+                .is_some_and(|(bound_col, _, _)| bound_col.eq_ignore_ascii_case(column))
+        }
+        Expr::Between {
+            expr: operand,
+            low,
+            high,
+            not: false,
+            ..
+        } => {
+            !(is_index_range_constant(low)
+                && is_index_range_constant(high)
+                && column_name(operand, table, table_alias)
+                    .is_some_and(|bound_col| bound_col.eq_ignore_ascii_case(column)))
+        }
+        _ => true,
+    })
 }
 
 /// A composite-index seek target: an equality prefix on the leading key columns plus a range on
@@ -46139,6 +46428,221 @@ mod tests {
         }
     }
 
+    /// Whether the program opens `idx_t_k` (the single-column `k` index of the fixture).
+    fn bd_2dgf5_opens_idx_k(ops: &[VdbeOp]) -> bool {
+        ops.iter().any(|op| op.opcode == Opcode::OpenRead
+            && matches!(&op.p4, P4::Index(name) if name == "idx_t_k"))
+    }
+
+    fn bd_2dgf5_variables(ops: &[VdbeOp]) -> Vec<i32> {
+        ops.iter()
+            .filter(|op| op.opcode == Opcode::Variable)
+            .map(|op| op.p1)
+            .collect()
+    }
+
+    /// `WHERE k <range> AND <residual>` (non-aggregate) seeks the single-column index and
+    /// re-applies the WHOLE WHERE per row — instead of declining to a full scan. The residual
+    /// re-emission includes the range conjuncts, so a numbered bound slot appears twice: once
+    /// in the seek's bound probes and once in the per-row filter (mirroring the equality
+    /// residual's double emission on its seek/fallback paths).
+    #[test]
+    fn nonaggregate_index_range_residual_seeks_with_numbered_bounds() {
+        // Literal bounds + literal residual: the seek engages — index OpenRead + IdxRowid walk,
+        // and no table Rewind anywhere.
+        let ops = bd_2dgf5_program("SELECT id FROM t WHERE k > 1 AND k < 9 AND v = 'x'");
+        assert!(
+            bd_2dgf5_opens_idx_k(&ops),
+            "index range + residual must open idx_t_k"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::IdxRowid),
+            "index range + residual must walk the index (IdxRowid)"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "index range + residual must not full-scan (no Rewind)"
+        );
+
+        // Numbered placeholder bounds + numbered residual: every slot keeps its textual index.
+        // Emission order: lower probe (?1), upper probe (?2), then the per-row filter re-applies
+        // the whole WHERE in text order (?1, ?2, ?3).
+        let ops = bd_2dgf5_program("SELECT id FROM t WHERE k >= ?1 AND k < ?2 AND v = ?3");
+        assert!(
+            bd_2dgf5_opens_idx_k(&ops),
+            "placeholder-bounded range + residual must open idx_t_k"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "a lower-bounded placeholder range must SeekGE"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1, 2, 1, 2, 3],
+            "bound probes emit their textual slots; the residual filter re-emits the whole WHERE"
+        );
+
+        // A numbered LIMIT keeps its textual slot and does not displace the seek. LIMIT emits
+        // first, so its Variable leads the sequence.
+        let ops = bd_2dgf5_program("SELECT id FROM t WHERE k > ?1 AND k < ?2 AND v = ?3 LIMIT ?4");
+        assert!(
+            bd_2dgf5_opens_idx_k(&ops),
+            "a numbered LIMIT must not displace the placeholder range residual seek"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![4, 1, 2, 1, 2, 3],
+            "LIMIT emits first but keeps slot 4; probes and filter keep their textual slots"
+        );
+
+        // Residual placeholder BEFORE the bounds in text order: the filter still re-applies the
+        // whole WHERE in text order, so slot 3 leads the filter's triple.
+        let ops = bd_2dgf5_program("SELECT id FROM t WHERE v = ?3 AND k >= ?1 AND k < ?2");
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1, 2, 3, 1, 2],
+            "probes emit by slot (lower, upper); the filter re-applies the WHERE in text order"
+        );
+    }
+
+    /// Declines and precedence for the non-aggregate index-range residual: raw anonymous/named
+    /// ASTs decline (until connection canonicalization numbers the slots), a pure range with no
+    /// residual keeps the residual-free bare path (single emission of the bounds, no filter),
+    /// and a rowid range residual outranks the index range residual (rowid-order walk).
+    #[test]
+    fn nonaggregate_index_range_residual_declines_and_precedence() {
+        // Raw anonymous/named AST: decline, keep the full scan.
+        for sql in [
+            "SELECT id FROM t WHERE k > ? AND k < ? AND v = ?",
+            "SELECT id FROM t WHERE k > :lo AND k < :hi AND v = :res",
+            "SELECT id FROM t WHERE k > ?1 AND k < ?2 AND v = ?",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            assert!(
+                !bd_2dgf5_opens_idx_k(&ops),
+                "raw non-numbered slots must decline the range residual seek: `{sql}`"
+            );
+        }
+
+        // Pure range, no residual: the bare path owns it — bounds emit exactly once and no
+        // per-row filter is emitted (no Variable at all for literal bounds).
+        let ops = bd_2dgf5_program("SELECT id FROM t WHERE k > 1 AND k < 9");
+        assert!(bd_2dgf5_opens_idx_k(&ops), "the bare range still seeks");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::IdxRowid),
+            "the bare range walks the index"
+        );
+        assert!(
+            ops.iter()
+                .filter(|op| matches!(op.opcode, Opcode::Ne | Opcode::Eq | Opcode::IfNot))
+                .count()
+                == 0,
+            "no residual filter is emitted for a pure range (no per-row predicate opcodes)"
+        );
+
+        // Rowid range + residual outranks the index range + residual: the walk stays in rowid
+        // order and idx_t_k is never opened.
+        let ops = bd_2dgf5_program("SELECT id FROM t WHERE id > 5 AND id < 9 AND k > 1");
+        assert!(
+            !bd_2dgf5_opens_idx_k(&ops),
+            "a rowid range residual must win over the index range residual"
+        );
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGT),
+            "the rowid range residual seeks the table b-tree"
+        );
+    }
+
+    /// `WHERE <rowid> <placeholder range> AND <residual>` walks only the [lower, upper] rowid
+    /// slice and re-applies the whole WHERE per row. Numbered bounds keep their textual slots in
+    /// the seek probes regardless of the conjuncts' text order — the filter re-emission
+    /// re-derives the text order independently.
+    #[test]
+    fn nonaggregate_rowid_range_residual_placeholder_bounds_seek() {
+        // Numbered lower bound + numbered residual: probes then filter.
+        let ops = bd_2dgf5_program("SELECT id, v FROM t WHERE id > ?1 AND v = ?2");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGT),
+            "a placeholder rowid range + residual must SeekGT"
+        );
+        assert!(
+            !ops.iter().any(|op| op.opcode == Opcode::Rewind),
+            "a placeholder rowid range + residual must not full-scan"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1, 1, 2],
+            "the lower probe emits slot 1; the filter re-applies the whole WHERE (slots 1, 2)"
+        );
+
+        // Reversed text order (`id < ?2` written first): the probes still bind each bound to
+        // ITS OWN textual slot (lower=?1, upper=?2), and the filter re-applies in text order.
+        let ops = bd_2dgf5_program("SELECT id, v FROM t WHERE id < ?2 AND id >= ?1 AND v = ?3");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "the inclusive placeholder lower bound must SeekGE"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1, 2, 2, 1, 3],
+            "probes emit by slot (lower=?1, upper=?2); the filter re-applies text order (?2, ?1, ?3)"
+        );
+
+        // BETWEEN form with placeholder bounds + residual.
+        let ops = bd_2dgf5_program("SELECT id, v FROM t WHERE id BETWEEN ?1 AND ?2 AND v = ?3");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGE),
+            "a placeholder BETWEEN + residual must SeekGE the lower bound"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1, 2, 1, 2, 3],
+            "BETWEEN probes emit slots 1, 2; the filter re-applies the whole WHERE"
+        );
+
+        // The residual may itself carry the only placeholders (literal bounds unchanged).
+        let ops = bd_2dgf5_program("SELECT id, v FROM t WHERE id > 5 AND v = ?");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGT),
+            "literal bounds with an anonymous residual `?` keep the existing seek"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1],
+            "the anonymous residual `?` numbers from the WHERE's textual base"
+        );
+    }
+
+    /// Declines for the placeholder-bounded rowid range residual: raw anonymous/named bound
+    /// placeholders (no canonicalization) keep the full scan, and the bare placeholder range
+    /// (no residual) keeps its existing seek.
+    #[test]
+    fn nonaggregate_rowid_range_residual_placeholder_declines() {
+        for sql in [
+            "SELECT id, v FROM t WHERE id > ? AND v = ?2",
+            "SELECT id, v FROM t WHERE id > :lo AND v = ?1",
+            "SELECT id, v FROM t WHERE id > ?1 AND v = ?",
+        ] {
+            let ops = bd_2dgf5_program(sql);
+            assert!(
+                !ops.iter().any(|op| matches!(op.opcode, Opcode::SeekGT | Opcode::SeekGE)),
+                "raw non-numbered slots must decline the placeholder rowid range residual: `{sql}`"
+            );
+        }
+
+        // Bare placeholder range without a residual: unchanged, still seeks (slots emit once).
+        let ops = bd_2dgf5_program("SELECT id FROM t WHERE id > ?1");
+        assert!(
+            ops.iter().any(|op| op.opcode == Opcode::SeekGT),
+            "the bare placeholder rowid range keeps its seek"
+        );
+        assert_eq!(
+            bd_2dgf5_variables(&ops),
+            vec![1],
+            "the bare range emits its bound exactly once"
+        );
+    }
+
     /// Index of the first instruction of the scan fallback.
     ///
     /// The fallback always opens the table and immediately rewinds it. The
@@ -46614,6 +47118,190 @@ mod tests {
                 !ops.iter().any(|op| op.opcode == Opcode::OpenAutoindex
                     && ops.iter().any(|o| o.opcode == Opcode::SeekRowid && o.p1 == 0)),
                 "`{sql}` must not build a rowid probe set"
+            );
+        }
+    }
+
+    /// bd-j9gub table: `t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, n INTEGER)` with two
+    /// composite indexes, `t_ab(a, b)` then `t_an(a, n)` — no single-column index, so a
+    /// leading-column equality pins only a PREFIX and the pre-fix code declined it.
+    fn bd_j9gub_table() -> TableSchema {
+        let typed = |name: &str, affinity: char, is_ipk: bool| {
+            ColumnInfo::basic(name, affinity, is_ipk)
+        };
+        let index = |name: &str, root: i32, columns: &[&str]| IndexSchema {
+            name: name.to_owned(),
+            root_page: root,
+            columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            key_expressions: columns.iter().map(|c| (*c).to_owned()).collect(),
+            key_sort_directions: Vec::new(),
+            where_clause: None,
+            is_unique: false,
+            key_collations: Vec::new(),
+            conflict_action: None,
+        };
+        TableSchema {
+            name: "t".to_owned(),
+            root_page: 2,
+            columns: vec![
+                typed("id", 'D', true),
+                typed("a", 'D', false),
+                typed("b", 'D', false),
+                typed("n", 'D', false),
+            ],
+            indexes: vec![index("t_ab", 3, &["a", "b"]), index("t_an", 4, &["a", "n"])],
+            strict: false,
+            without_rowid: false,
+            primary_key_constraints: Vec::new(),
+            check_constraints: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
+    }
+
+    /// bd-j9gub: DELETE/UPDATE whose equality conjuncts pin a PREFIX of a composite index's
+    /// key columns (leading column only, or the first two against a longer key elsewhere;
+    /// literal or numbered parameter; with or without residual conjuncts) must seek the
+    /// index instead of full-scanning the table, and the longest pinned prefix must win
+    /// the index choice. A WHERE that pins no leading column of any index must keep
+    /// scanning. Results/semantics are covered by `bd_j9gub_dml_prefix_seek_oracle`.
+    #[test]
+    fn bd_j9gub_dml_seeks_composite_index_prefix() {
+        let program = |sql: &str| -> Vec<VdbeOp> {
+            let Some((statement, tail)) =
+                parse_first_statement_with_tail(sql).expect("test SQL should parse")
+            else {
+                unreachable!("expected parsed statement");
+            };
+            assert_eq!(tail, sql.len(), "parser left trailing SQL: {sql}");
+            let schema = vec![bd_j9gub_table()];
+            let mut b = ProgramBuilder::new();
+            let ctx = CodegenContext::default();
+            match statement {
+                Statement::Update(stmt) => codegen_update(&mut b, &stmt, &schema, &ctx),
+                Statement::Delete(stmt) => codegen_delete(&mut b, &stmt, &schema, &ctx),
+                other => panic!("unexpected statement {other:?}"),
+            }
+            .unwrap_or_else(|e| panic!("`{sql}` should compile: {e}"));
+            b.finish().expect("program should finish").ops().to_vec()
+        };
+        // The one fresh index-read cursor a seek program opens, or None when the
+        // program opens no index for reading (a scan).
+        let index_read_cursor = |ops: &[VdbeOp]| -> Option<(i32, String)> {
+            ops.iter().find_map(|op| {
+                if op.opcode == Opcode::OpenRead
+                    && let P4::Index(name) = &op.p4
+                {
+                    Some((op.p1, name.clone()))
+                } else {
+                    None
+                }
+            })
+        };
+        let table_walks = |ops: &[VdbeOp]| {
+            ops.iter()
+                .filter(|op| {
+                    op.p1 == 0
+                        && matches!(
+                            op.opcode,
+                            Opcode::Rewind | Opcode::Next | Opcode::Last | Opcode::Prev
+                        )
+                })
+                .count()
+        };
+        // The field count of the MakeRecord feeding the first SeekGE on the index
+        // read cursor: the pinned prefix width (a true prefix record), or one more
+        // when the probe carries the full key plus its rowid floor.
+        let probe_record_width = |ops: &[VdbeOp], cursor: i32| -> Option<i32> {
+            let seek = ops.iter().find(|op| {
+                matches!(op.opcode, Opcode::SeekGE | Opcode::SeekLE) && op.p1 == cursor
+            })?;
+            ops.iter()
+                .find(|op| op.opcode == Opcode::MakeRecord && op.p3 == seek.p3)
+                .map(|op| op.p2)
+        };
+        let table_seeks = |ops: &[VdbeOp]| {
+            ops.iter()
+                .filter(|op| op.opcode == Opcode::SeekRowid && op.p1 == 0)
+                .count()
+        };
+
+        // (sql, seeked index, probe width, expected SeekRowid count on the table cursor)
+        // Probe width 1 = a true one-field prefix record (no padded rowid floor);
+        // width 3 = full key (a, b) + i64::MIN floor, byte-identical to GH#434.
+        // Bare shapes re-seek the table once (Pass 2); residual shapes twice (the
+        // collect positions each candidate to re-apply the full WHERE, then Pass 2).
+        let seek_shapes: &[(&str, &str, i32, usize)] = &[
+            ("DELETE FROM t WHERE a = 3", "t_ab", 1, 1),
+            ("DELETE FROM t WHERE a = ?1", "t_ab", 1, 1),
+            ("DELETE FROM t WHERE a = 3 AND n > 5", "t_ab", 1, 2),
+            ("DELETE FROM t WHERE a = ?1 AND b > ?2", "t_ab", 1, 2),
+            ("UPDATE t SET n = n + 1 WHERE a = 3", "t_ab", 1, 1),
+            ("UPDATE t SET n = n + 1 WHERE a = ?1", "t_ab", 1, 1),
+            ("UPDATE t SET n = ?2 WHERE a = ?1 AND n > 0", "t_ab", 1, 2),
+            // Longest pinned prefix wins: (a, b) and (a, n) both start with a, so
+            // pinning the second column selects the index it completes.
+            ("DELETE FROM t WHERE a = 3 AND b = 4", "t_ab", 3, 1),
+            ("DELETE FROM t WHERE a = ?1 AND b = ?2", "t_ab", 3, 1),
+            ("DELETE FROM t WHERE a = 3 AND n = 7", "t_an", 3, 1),
+            ("UPDATE t SET n = n + 1 WHERE a = 3 AND b = 4", "t_ab", 3, 1),
+            // The pinned prefix is narrowed but the trailing key column stays
+            // unconstrained: a two-field prefix of t_ab's (a, b) key.
+            ("DELETE FROM t WHERE a = 3 AND b = 4 AND n > 1", "t_ab", 3, 2),
+            ("UPDATE t SET n = n + 1 WHERE a = 3 AND n = 7", "t_an", 3, 1),
+        ];
+        for &(sql, expected_index, expected_width, expected_seeks) in seek_shapes {
+            let ops = program(sql);
+            let Some((cursor, index)) = index_read_cursor(&ops) else {
+                panic!("`{sql}` must open a fresh index read cursor and seek it");
+            };
+            assert_eq!(
+                index, expected_index,
+                "`{sql}` must pick the longest pinned prefix index"
+            );
+            assert_eq!(
+                table_walks(&ops),
+                0,
+                "`{sql}` must not walk the table cursor"
+            );
+            assert!(
+                ops.iter()
+                    .any(|op| matches!(op.opcode, Opcode::SeekGE) && op.p1 == cursor),
+                "`{sql}` must SeekGE the index read cursor"
+            );
+            assert_eq!(
+                probe_record_width(&ops, cursor),
+                Some(expected_width),
+                "`{sql}` probe record width"
+            );
+            assert_eq!(
+                table_seeks(&ops),
+                expected_seeks,
+                "`{sql}` table SeekRowid count (collect residual + Pass 2)"
+            );
+            assert!(
+                ops.iter().any(|op| op.opcode == Opcode::Close && op.p1 == cursor),
+                "`{sql}` must close the index read cursor before Pass 2"
+            );
+        }
+
+        // No index has these columns first (or at all): the collect must keep the
+        // full-scan RowSet plan.
+        for sql in [
+            "DELETE FROM t WHERE b = 3",
+            "DELETE FROM t WHERE n = 5",
+            "DELETE FROM t WHERE b = 3 AND n = 5",
+            "UPDATE t SET n = n + 1 WHERE b = 3",
+            "UPDATE t SET n = n + 1 WHERE n = 5",
+            "UPDATE t SET b = ?1 WHERE n > ?2",
+        ] {
+            let ops = program(sql);
+            assert!(
+                table_walks(&ops) > 0,
+                "`{sql}` pins no index prefix and must scan the table"
+            );
+            assert!(
+                index_read_cursor(&ops).is_none(),
+                "`{sql}` must not open an index read cursor"
             );
         }
     }
