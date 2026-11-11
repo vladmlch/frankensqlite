@@ -46,6 +46,7 @@ criterion/
 # Fuzz corpus and artifacts
 fuzz/corpus/
 fuzz/artifacts/
+fuzz/campaign/
 
 # Debug and log files
 *.log

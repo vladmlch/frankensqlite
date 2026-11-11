@@ -11,12 +11,21 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 
+# Async runtime driving the engine's futures inside the differential targets
+# (same builder its own test utils use; no tokio anywhere in this workspace).
+asupersync = { version = "0.5.0", default-features = false }
+# Stock SQLite as the differential reference implementation. Kept INSIDE the
+# fuzz crate only, mirroring the fork's differential oracle tests, which use
+# rusqlite as a dev-dependency; never in a library crate.
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+
 # Workspace crates under fuzz
 fsqlite-parser = { path = "../crates/fsqlite-parser" }
 fsqlite-types = { path = "../crates/fsqlite-types" }
 fsqlite-ast = { path = "../crates/fsqlite-ast" }
 fsqlite-error = { path = "../crates/fsqlite-error" }
 fsqlite-mvcc = { path = "../crates/fsqlite-mvcc" }
+fsqlite-core = { path = "../crates/fsqlite-core" }
 
 [[bin]]
 name = "fuzz_sql_parser"
@@ -41,4 +50,9 @@ doc = false
 [[bin]]
 name = "xor_merge_guard"
 path = "fuzz_targets/xor_merge_guard.rs"
+doc = false
+
+[[bin]]
+name = "fuzz_diff_seek_dml"
+path = "fuzz_targets/fuzz_diff_seek_dml.rs"
 doc = false
