@@ -69,8 +69,6 @@ fi
 
 cd "$REPO_ROOT" || exit 2
 
-START_TS=$(date +%s)
-
 # --- build (lockf-wrapped where the courtesy lock exists) ----------------
 # This reproduces exactly what `cargo fuzz build` runs internally: the sancov
 # instrumentation flags libFuzzer needs plus `--cfg fuzzing`. Two of
@@ -143,6 +141,10 @@ fi
 echo "binary: $BIN" >&2
 
 # --- run with plateau polling ---------------------------------------------
+# The clock starts here, after the build: the plateau window, the max-secs
+# cap and WALL_SECS measure fuzzing only, so a cold ~30 min build neither
+# eats the budget nor counts as a coverage plateau.
+START_TS=$(date +%s)
 : > "$LOG"
 "$BIN" \
     -fork="$FORKS" \
